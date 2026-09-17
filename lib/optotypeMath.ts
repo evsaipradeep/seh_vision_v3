@@ -219,8 +219,12 @@ export function detectDeviceScreenType(): DeviceScreenEstimate {
   }
 
   // 3. Laptop vs Desktop
-  // Laptops have high DPR (1.25, 1.5, 2.0 Retina) or compact screen resolutions <= 1600
-  const isLaptop = dpr > 1.1 || (minDim <= 1050 && maxDim <= 1600);
+  // Laptops have high DPR (1.25, 1.5, 2.0 Retina) or standard laptop resolutions (<= 1920x1200)
+  const isMac = /macintosh|mac os x/i.test(ua);
+  const isCrOS = /cros/i.test(ua);
+  const isWindows = /windows/i.test(ua);
+  const isLaptopResolution = maxDim <= 1920 && minDim <= 1200;
+  const isLaptop = dpr > 1.1 || isLaptopResolution || isMac || isCrOS;
   if (isLaptop) {
     return DEVICE_PRESETS.laptop;
   }

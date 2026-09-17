@@ -13,12 +13,10 @@ import {
   DistanceStabilityTracker,
 } from '@/lib/distanceEstimation';
 import {
-  getAutoDetectedProfile,
-  getAutoDetectedCalibration,
-  DeviceProfileInfo,
-  DEVICE_CALIBRATION_PROFILES,
+  detectDeviceDetails,
 } from '@/lib/deviceDetection';
 import { VisionEngine } from '@/lib/visionEngine';
+import { installTfliteFilter } from '@/lib/suppressTFLiteLogs';
 import { FacePositionGuide } from './FacePositionGuide';
 import {
   Camera,
@@ -76,22 +74,27 @@ export const DistanceGate: React.FC<DistanceGateProps> = ({
     facingModeRef.current = facingMode;
   }, [facingMode]);
 
-  // Auto-detected device profile and lens calibration state (kept internal for optical accuracy)
-  const [deviceProfile, setDeviceProfile] = useState<DeviceProfileInfo>(() => getAutoDetectedProfile('user'));
-  const [calibration, setCalibration] = useState<DistanceCalibrationParams>(() => getSavedDistanceCalibration('user'));
-  const calibrationRef = useRef<DistanceCalibrationParams>(calibration);
+  // Auto-calibrated optical parameters for active device and lens (runs seamlessly in the background)
+  const cameraLabelRef = useRef<string>('');
+  const calibrationRef = useRef<DistanceCalibrationParams>(getSavedDistanceCalibration('user'));
+
+  // Sync calibration when camera lens direction changes
   useEffect(() => {
-    calibrationRef.current = calibration;
-  }, [calibration]);
+    const base = detectDeviceDetails(facingMode, cameraLabelRef.current);
+    calibrationRef.current = base.calibration;
+  }, [facingMode]);
+
+  // Ensure WASM delegate logs are silenced upon mounting DistanceGate
+  useEffect(() => {
+    installTfliteFilter();
+  }, []);
 
   // Sync on window resize or orientation change without interrupting video stream
   useEffect(() => {
     const handleResize = () => {
       const mode = facingModeRef.current;
-      const updated = getAutoDetectedProfile(mode);
-      const savedCalib = getSavedDistanceCalibration(mode);
-      setDeviceProfile(updated);
-      setCalibration(savedCalib);
+      const updatedDetails = detectDeviceDetails(mode, cameraLabelRef.current);
+      calibrationRef.current = updatedDetails.calibration;
       if (videoRef.current && videoRef.current.videoWidth > 0) {
         setVideoDimensions({
           width: videoRef.current.videoWidth,
@@ -266,29 +269,50 @@ export const DistanceGate: React.FC<DistanceGateProps> = ({
 
       mediaStreamRef.current = stream;
 
-      // Auto-calibrate optical profile for active camera lens
-      const updatedProfile = getAutoDetectedProfile(targetMode);
-      const savedCalib = getSavedDistanceCalibration(targetMode);
-      setDeviceProfile(updatedProfile);
-      setCalibration(savedCalib);
-      calibrationRef.current = savedCalib;
+      // Extract real hardware camera label to detect built-in vs external webcam
+      const videoTrack = stream.getVideoTracks()[0];
+      const cameraLabel = videoTrack?.label || '';
+      cameraLabelRef.current = cameraLabel;
+
+      // Auto-calibrate optical profile for active device and camera lens seamlessly in background
+      const updatedDetails = detectDeviceDetails(targetMode, cameraLabel);
+      calibrationRef.current = updatedDetails.calibration;
 
       if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => {
-          if (videoRef.current) {
-            videoRef.current.play().catch(console.warn);
-            const w = videoRef.current.videoWidth || 640;
-            const h = videoRef.current.videoHeight || 480;
-            setVideoDimensions({ width: w, height: h });
-            setCameraState('streaming');
+        const vid = videoRef.current;
+        let isStarted = false;
 
-            // Resume computer vision engine once new stream is playing
-            if (visionEngineRef.current) {
-              visionEngineRef.current.start(videoRef.current);
-            }
+        const onStreamReady = () => {
+          if (isStarted) return;
+          isStarted = true;
+          vid.muted = true;
+          vid.setAttribute('playsinline', 'true');
+          vid.play().catch((e) => console.warn('Camera video play caught:', e));
+          const w = vid.videoWidth || 640;
+          const h = vid.videoHeight || 480;
+          setVideoDimensions({ width: w, height: h });
+          setCameraState('streaming');
+
+          // Resume computer vision engine once stream is playing
+          if (visionEngineRef.current) {
+            visionEngineRef.current.start(vid);
           }
         };
+
+        vid.onloadedmetadata = onStreamReady;
+        vid.srcObject = stream;
+
+        // If metadata is already loaded (common in Chromium/Edge on laptops/PCs)
+        if (vid.readyState >= 1 && vid.videoWidth > 0) {
+          onStreamReady();
+        } else {
+          // Safeguard timer so camera never hangs on "Opening camera sensor..."
+          setTimeout(() => {
+            if (!isStarted && vid.srcObject === stream) {
+              onStreamReady();
+            }
+          }, 600);
+        }
       }
     } catch (err: any) {
       console.warn('Camera permission or device error:', err);
@@ -338,6 +362,9 @@ export const DistanceGate: React.FC<DistanceGateProps> = ({
 
     visionEngineRef.current = engine;
     engine.initialize().then(() => {
+      startCamera('user');
+    }).catch((err) => {
+      console.info('Vision engine fallback initialization:', err);
       startCamera('user');
     });
 

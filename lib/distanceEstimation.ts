@@ -22,7 +22,7 @@ import {
 import { getAutoDetectedCalibration } from './deviceDetection';
 
 // Local storage key prefix for custom device distance calibration
-const DISTANCE_CALIBRATION_STORAGE_PREFIX = 'sankara_device_dist_calib_v2_';
+const DISTANCE_CALIBRATION_STORAGE_PREFIX = 'sankara_device_dist_calib_v4_';
 
 function getStorageKey(facingMode: 'user' | 'environment'): string {
   return `${DISTANCE_CALIBRATION_STORAGE_PREFIX}${facingMode}`;
@@ -34,6 +34,13 @@ function getStorageKey(facingMode: 'user' | 'environment'): string {
 export function getSavedDistanceCalibration(facingMode: 'user' | 'environment' = 'user'): DistanceCalibrationParams {
   if (typeof window === 'undefined') return getAutoDetectedCalibration(facingMode);
   try {
+    // Purge outdated v1, v2, and v3 cached calibrations so laptops immediately receive new precision calibration
+    localStorage.removeItem('sankara_device_dist_calib_v3_user');
+    localStorage.removeItem('sankara_device_dist_calib_v3_environment');
+    localStorage.removeItem('sankara_device_dist_calib_v2_user');
+    localStorage.removeItem('sankara_device_dist_calib_v2_environment');
+    localStorage.removeItem('sankara_device_distance_calibration_v1');
+
     const key = getStorageKey(facingMode);
     const raw = localStorage.getItem(key);
     const autoDefault = getAutoDetectedCalibration(facingMode);
@@ -74,7 +81,11 @@ export function resetDistanceCalibration(facingMode?: 'user' | 'environment'): D
         localStorage.removeItem(getStorageKey('user'));
         localStorage.removeItem(getStorageKey('environment'));
       }
-      // Also clean up obsolete legacy v1 key
+      // Also clean up obsolete legacy v1, v2, & v3 keys
+      localStorage.removeItem('sankara_device_dist_calib_v3_user');
+      localStorage.removeItem('sankara_device_dist_calib_v3_environment');
+      localStorage.removeItem('sankara_device_dist_calib_v2_user');
+      localStorage.removeItem('sankara_device_dist_calib_v2_environment');
       localStorage.removeItem('sankara_device_distance_calibration_v1');
     } catch {
       // ignore
@@ -154,9 +165,9 @@ export function calculateRawEstimatedDistance(
   calibration: DistanceCalibrationParams = DEFAULT_DISTANCE_CALIBRATION
 ): number {
   const { nominalIpdConstant, nominalFaceWidthConstant, userFocalMultiplier } = calibration;
-  const nominalIrisConstant = calibration.nominalIrisConstant ?? (nominalIpdConstant * (11.7 / 63.0));
+  const nominalIrisConstant = calibration.nominalIrisConstant ?? (nominalIpdConstant * (11.71 / 63.0));
   const nominalBiocularConstant = calibration.nominalBiocularConstant ?? (nominalIpdConstant * (92.0 / 63.0));
-  const nominalFaceHeightConstant = calibration.nominalFaceHeightConstant ?? 0.1375;
+  const nominalFaceHeightConstant = calibration.nominalFaceHeightConstant ?? (nominalIpdConstant * (175.0 / 63.0));
 
   // Yaw foreshortening compensation factor (cos yaw)
   const rawYawDeg = measurement.headYawDeg ?? 0;
@@ -172,54 +183,76 @@ export function calculateRawEstimatedDistance(
   const cosPitch = Math.cos(pitchRad);
   const pitchForeshorteningFactor = Math.max(0.55, Math.min(1.0, cosPitch));
 
+  // Adaptive Personal Scale Calibration via Iris-to-IPD Ratio:
+  // Human corneal/iris diameter (HVID) is 11.71mm ± 0.4mm across virtually all humans (ages 2 to 90).
+  // Nominal IPD is 63.0mm. The standard anthropometric ratio IPD / Iris is 63.0 / 11.71 = 5.38.
+  // If a child (e.g. 57mm IPD) or someone with narrower/wider interpupillary distance is tested,
+  // the ratio scales their personalized facial geometry while keeping iris as the ground-truth anchor.
+  let anatomicalScale = 1.0;
+  const hasValidIris = !!(measurement.irisDiameterNorm && measurement.irisDiameterNorm > 0.0035 && measurement.irisDiameterNorm < 0.035);
+  const hasValidIpd = !!(measurement.interpupillaryDistanceNorm && measurement.interpupillaryDistanceNorm > 0.012);
+
+  if (hasValidIris && hasValidIpd) {
+    const rawRatio = (measurement.interpupillaryDistanceNorm! / yawForeshorteningFactor) / measurement.irisDiameterNorm!;
+    if (rawRatio >= 4.2 && rawRatio <= 6.6) {
+      anatomicalScale = Math.max(0.88, Math.min(1.12, rawRatio / 5.38));
+    }
+  }
+
+  const effectiveIpdConstant = nominalIpdConstant * anatomicalScale;
+  const effectiveBiocularConstant = nominalBiocularConstant * anatomicalScale;
+  const effectiveFaceWidthConstant = nominalFaceWidthConstant * anatomicalScale;
+  const effectiveFaceHeightConstant = nominalFaceHeightConstant * (0.6 + 0.4 * anatomicalScale);
+
   const estimates: { distance: number; weight: number; label: string }[] = [];
 
-  // Metric 1: Interpupillary Distance (IPD ~63 mm) - Primary Anchor (sub-pixel pupil center accuracy)
-  if (measurement.interpupillaryDistanceNorm && measurement.interpupillaryDistanceNorm > 0.012) {
-    const correctedIpdNorm = measurement.interpupillaryDistanceNorm / yawForeshorteningFactor;
-    const distFromIpd = (nominalIpdConstant / correctedIpdNorm) * userFocalMultiplier;
+  // Metric 1: Interpupillary Distance (IPD ~63 mm with anatomical scale tuning)
+  if (hasValidIpd) {
+    const correctedIpdNorm = measurement.interpupillaryDistanceNorm! / yawForeshorteningFactor;
+    const distFromIpd = (effectiveIpdConstant / correctedIpdNorm) * userFocalMultiplier;
     if (distFromIpd >= 0.25 && distFromIpd <= 3.5) {
-      const weight = Math.max(0.25, 0.48 * yawForeshorteningFactor);
+      const weight = Math.max(0.28, 0.45 * yawForeshorteningFactor);
       estimates.push({ distance: distFromIpd, weight, label: 'ipd' });
     }
   }
 
-  // Metric 2: Bi-ocular width (outer canthus to outer canthus ~92 mm) - Secondary Anchor
+  // Metric 2: Horizontal Visible Iris Diameter (HVID ~11.71 mm) - Absolute invariant ground truth
+  if (hasValidIris) {
+    const distFromIris = (nominalIrisConstant / measurement.irisDiameterNorm!) * userFocalMultiplier;
+    if (distFromIris >= 0.25 && distFromIris <= 3.5) {
+      // Iris diameter is physically constant across human demographics
+      estimates.push({ distance: distFromIris, weight: 0.22, label: 'iris' });
+    }
+  }
+
+  // Metric 3: Bi-ocular width (outer canthus to outer canthus ~92 mm)
   if (measurement.biocularWidthNorm && measurement.biocularWidthNorm > 0.02) {
     const correctedBiocularNorm = measurement.biocularWidthNorm / yawForeshorteningFactor;
-    const distFromBiocular = (nominalBiocularConstant / correctedBiocularNorm) * userFocalMultiplier;
+    const distFromBiocular = (effectiveBiocularConstant / correctedBiocularNorm) * userFocalMultiplier;
     if (distFromBiocular >= 0.25 && distFromBiocular <= 3.5) {
-      const weight = Math.max(0.18, 0.28 * yawForeshorteningFactor);
+      const weight = Math.max(0.18, 0.26 * yawForeshorteningFactor);
       estimates.push({ distance: distFromBiocular, weight, label: 'biocular' });
     }
   }
 
-  // Metric 3: Vertical Face Height (FOREHEAD-TO-CHIN ~175 mm) - Yaw-Invariant Anchor
+  // Metric 4: Vertical Face Height (FOREHEAD-TO-CHIN ~175 mm) - Yaw-Invariant Anchor
   if (measurement.faceHeightNorm && measurement.faceHeightNorm > 0.035) {
     const correctedHeightNorm = measurement.faceHeightNorm / pitchForeshorteningFactor;
-    const distFromHeight = (nominalFaceHeightConstant / correctedHeightNorm) * userFocalMultiplier;
+    const distFromHeight = (effectiveFaceHeightConstant / correctedHeightNorm) * userFocalMultiplier;
     if (distFromHeight >= 0.25 && distFromHeight <= 3.5) {
       // When head is turned sideways, height becomes even more important
-      const weight = (0.20 + 0.25 * (1 - yawForeshorteningFactor)) * pitchForeshorteningFactor;
+      const weight = (0.18 + 0.25 * (1 - yawForeshorteningFactor)) * pitchForeshorteningFactor;
       estimates.push({ distance: distFromHeight, weight, label: 'height' });
     }
   }
 
-  // Metric 4: Bizygomatic Face Width with yaw compensation (~137 mm)
+  // Metric 5: Bizygomatic Face Width with yaw compensation (~137 mm)
   if (measurement.faceWidthNorm && measurement.faceWidthNorm > 0.03) {
     const correctedWidthNorm = measurement.faceWidthNorm / yawForeshorteningFactor;
-    const distFromWidth = (nominalFaceWidthConstant / correctedWidthNorm) * userFocalMultiplier;
+    const distFromWidth = (effectiveFaceWidthConstant / correctedWidthNorm) * userFocalMultiplier;
     if (distFromWidth >= 0.25 && distFromWidth <= 3.5) {
-      const weight = Math.max(0.08, 0.16 * yawForeshorteningFactor);
+      const weight = Math.max(0.08, 0.15 * yawForeshorteningFactor);
       estimates.push({ distance: distFromWidth, weight, label: 'face_width' });
-    }
-  }
-
-  // Metric 5: Horizontal Visible Iris Diameter (HVID ~11.7 mm) - Supplementary Micro-Anchor
-  if (measurement.irisDiameterNorm && measurement.irisDiameterNorm > 0.0035) {
-    const distFromIris = (nominalIrisConstant / measurement.irisDiameterNorm) * userFocalMultiplier;
-    if (distFromIris >= 0.30 && distFromIris <= 3.2) {
-      estimates.push({ distance: distFromIris, weight: 0.08, label: 'iris' });
     }
   }
 
